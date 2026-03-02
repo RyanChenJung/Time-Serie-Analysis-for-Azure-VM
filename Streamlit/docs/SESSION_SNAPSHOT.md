@@ -1,26 +1,47 @@
 # docs/SESSION_SNAPSHOT.md
 
-## Last Updated: 2026-02-23
-## Project State: Phase 3.1.5-r2 Complete
+## Last Updated: 2026-03-01
+## Project State: Phase 3.2.5 Complete
 
 ### 1. CURRENT CONTEXT
-- **Phase 3.1.5-r2 (Real-time Auto-ARIMA Streaming + Bug Fix) is complete.**
+- **Phase 3.2.5 (Holt-Winters Auto-Optimization & UI Integration) is complete.**
 
-**Two bugs fixed:**
-1. **Number input fields did not update after Auto-Optimize** — root cause: `st.number_input` widget session state (`st.session_state[f"sp_{vm}"]`) takes precedence over the `value=` parameter on reruns. Fix: explicitly set all 7 widget keys in `st.session_state` before `st.rerun()`.
-2. **True real-time streaming** — implemented via `threading.Thread` + `queue.Queue`:
-   - `stream_auto_arima(series, period, log_queue)` in `utils/forecasting.py` uses `_QueueWriter` (a `sys.stdout` replacement) that calls `log_queue.put(line)` for each trace line, then puts `None` as a sentinel.
-   - App.py spawns a daemon thread running `stream_auto_arima`, then blocks on `log_queue.get()` in a while loop, calling `st.empty().code(...)` per line for true line-by-line streaming.
+**Deliverables this session:**
+
+1. **`utils/forecasting.py` — `auto_optimize_holt_winters(series, seasonal_periods, progress_callback=None)`**
+   - `import itertools` added at module level.
+   - Full search grid: `trend_opts = ['add', 'mul', None]`, `seasonal_opts` conditioned on `seasonal_periods > 1`, `damped_opts = [True, False]`.
+   - **Pre-filtering**: combos where `damped=True` and `trend=None` are excluded before the loop (statsmodels raises ValueError for this combo — avoids wasted fits).
+   - Each combo individually wrapped in `try/except`; multiplicative failures on near-zero data are caught, logged in `trace[i]['error']`, and the loop continues.
+   - `progress_callback(line: str)` is called after every combo — decouples the backend search completely from any UI framework (Streamlit, or testable without it).
+   - Returns `{'best_config', 'best_rmse', 'best_label', 'trace'}`.
+
+2. **`app.py` — HW Auto-Optimize UI**
+   - Import updated: `auto_optimize_holt_winters` added alongside existing forecasting imports.
+   - HW Control Panel now has **two side-by-side buttons**: `✨ Auto-Optimize Parameters` (left) + `🚀 Run Holt-Winters Forecast` (right, primary).
+   - Auto-Optimize flow:
+     - Combo count computed inline and shown in `st.status` heading: `"🔍 Scanning N configurations…"`.
+     - `_hw_cb()` closure captures the `st.status` context and calls `st.write(line)` for each combo — produces a live scrolling log.
+     - On success: `hw_params[vm]` updated with `trend_label`, `season_label`, `damped` from the winning config; `_hw_status.update(state='complete')`; `st.rerun()` triggers selectboxes to repopulate.
+     - On error: `_hw_status.update(state='error', expanded=True)` with the exception message.
+
+3. **`tests/test_forecasting.py` — 4 new tests (`TestAutoOptimizeHoltWinters`)**
+   - `test_returns_required_keys`: all 4 expected keys present.
+   - `test_best_rmse_is_finite_and_non_negative`: guards against degenerate search.
+   - `test_trace_covers_all_combos`: trace length == number of valid combos (computed with same `itertools.product` logic as the function).
+   - `test_aperiodic_mode_only_non_seasonal_combos`: `seasonal_periods=1` → all trace entries have `seasonal=None`.
 
 ### 2. MODULE INVENTORY
-- `utils/forecasting.py`: `run_sarima_forecast`, `auto_optimize_sarima` (StringIO batch), `stream_auto_arima` (queue streaming)
-- `utils/baselines.py`, `utils/diagnostics.py`, `utils/data_engine.py`: unchanged
+- `utils/diagnostics.py`: `perform_adf_test`, `perform_ljung_box_test`, `calculate_refined_seasonality`, `classify_vm_suitability`, `calculate_pacf`
+- `utils/forecasting.py`: `run_sarima_forecast`, `run_holt_winters_forecast`, `auto_optimize_holt_winters` ← NEW, `auto_optimize_sarima`, `stream_auto_arima`
+- `utils/baselines.py`, `utils/data_engine.py`: unchanged
 
-### 3. IMMEDIATE OBJECTIVE
-- **Phase 3.2**: Residual Diagnostics (post-SARIMA Ljung-Box) or Random Forest model.
+### 3. TEST STATUS
+- **41/41 pytest tests passing (30.64s)** ✅
+  - 15 diagnostics · 9 SARIMA · 5 AutoSARIMA · 8 HW · 4 AutoHW · 5 infra
 
-### 4. PENDING DECISIONS
-- Phase 3.2: Residual Diagnostics vs. Random Forest — user to choose.
+### 4. IMMEDIATE OBJECTIVE
+- **Phase 3.3** (Residual Diagnostics polish / next feature) — awaiting user direction.
 
-### 5. TEST STATUS
-- **26/26 pytest tests passing (13.49s)**
+### 5. PENDING DECISIONS
+- None open. All Phases through 3.2.5 are complete.

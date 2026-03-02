@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from statsmodels.tsa.stattools import adfuller, acf
+from statsmodels.tsa.stattools import adfuller, acf, pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
 
@@ -133,3 +133,27 @@ def calculate_refined_seasonality(series, granularity):
         return int(detected_lag)
     else:
         return 1
+
+
+def calculate_pacf(series, nlags: int) -> np.ndarray:
+    """
+    Computes the Partial Autocorrelation Function (PACF) up to *nlags* lags.
+
+    Uses the Yule-Walker method (method='ywm'), which is numerically stable
+    even for short or near-stationary series.
+
+    *nlags* is silently clamped to ``len(series) // 2 - 1`` so callers need
+    not worry about out-of-range requests.
+
+    Returns
+    -------
+    np.ndarray of shape (nlags + 1,)  — index 0 is always 1.0 (lag-0).
+    """
+    clean = series.dropna()
+    if len(clean) < 4:
+        return np.array([1.0])
+
+    max_safe = len(clean) // 2 - 1
+    nlags = max(1, min(nlags, max_safe))
+
+    return pacf(clean, nlags=nlags, method='ywm')

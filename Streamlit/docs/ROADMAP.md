@@ -1,6 +1,6 @@
 # docs/ROADMAP.md
 
-## Project Status: 🚀 Phase 3 — Advanced Forecasting (3.1 DONE)
+## Project Status: 🚀 Phase 3 — Advanced Forecasting (3.1 DONE · 2.9 DONE · 2.9.5 DONE)
 
 ---
 
@@ -59,6 +59,20 @@
     - Leaderboard Integration: SARIMA row injected with hold-out RMSE/MAE/MAPE; winner recalculated across all models.
     - Expert Control Panel: p,d,q | P,D,Q,s inputs; smart `d` default (1 for ⚠️ Non-Stationary); Auto-Optimize + Execute buttons.
     - 14 new pytest tests → total 26/26 passing.
-- [ ] **3.2 Additional Advanced Models:** Random Forest or Prophet.
+- [x] **2.9 Explainability Boost & PACF Integration** ✅
+    - `utils/diagnostics.py`: `calculate_pacf()` with Yule-Walker method, safe nlags clamping.
+    - `app.py`: `build_pacf_chart()` helper; Section 4 upgraded to side-by-side ACF + PACF columns.
+    - Tab 1 Gatekeeper expander: new **Stage 3 — Auto-Seasonality Detection** section with full algorithm explanation and worked example.
+    - Holt-Winters placeholder expander added to Tab 2 (Section 6) as Phase 3.2 lead-in.
+    - 3 new pytest tests (AR1 spike, white noise bound, short-series guard) → 24/24 non-pmdarima tests passing.
+- [x] **2.9.5 Environment Fix & Aperiodic Logic Refinement** ✅
+    - `pmdarima 2.1.1` installed; **29/29 pytest tests now passing** (31.30s).
+    - `utils/diagnostics.py`: no change (HP-filter is a chart-helper concern).
+    - `app.py`: `hpfilter` imported from `statsmodels.tsa.filters.hp_filter`.
+    - `build_trend_residual_chart(series)`: HP-Filter with auto-lambda (1600 / 129600), fallback to 12-pt MA, 2-panel Trend+Residual chart (Plotly).
+    - Section 3 rewritten: `_is_aperiodic = (s <= 1)` branches to Aperiodic chart vs STL vs insufficient-data notice.
+    - Section 5 SARIMA panel: `_aperiodic_arima = (s <= 1)` hides P/D/Q/s block; `_P,_D,_Q,_s = 0,0,0,0` injected silently.
+    - Tab 1 Gatekeeper text: added Periodic/Aperiodic decision table and second example.
+- [ ] **3.2 Holt-Winters Exponential Smoothing:** Additive/multiplicative modes, AIC auto-fit, Leaderboard integration.
 - [ ] **3.3 Residual Diagnostics:** Post-modeling Ljung-Box and error distribution.
 - [ ] **3.4 Optimization Engine:** Capacity planning recommendations based on forecast peaks.
