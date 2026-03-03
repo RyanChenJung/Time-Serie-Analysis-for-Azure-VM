@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from io import StringIO
 
-DEFAULT_DATA_PATH = 'final_deep_readings_20vms.csv'
+DEFAULT_DATA_PATH = '../Data/final_deep_readings_20vms.csv'
 
 def load_data(uploaded_file=None):
     """
