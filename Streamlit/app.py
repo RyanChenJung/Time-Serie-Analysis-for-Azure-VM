@@ -25,7 +25,7 @@ from utils.baselines import expanding_window_cv, simple_holdout_evaluate
 from utils.forecasting import (
     run_sarima_forecast, auto_optimize_sarima, stream_auto_arima,
     run_holt_winters_forecast, auto_optimize_holt_winters,
-    build_exog_df,
+    build_exog_df, run_var_forecast,
 )
 import threading
 import queue
@@ -61,6 +61,8 @@ if 'hw_params' not in st.session_state:
     st.session_state.hw_params = {}        # vm_id -> {trend_label, season_label, damped, steps, last_opt_summary, last_opt_error}
 if 'hw_logs' not in st.session_state:
     st.session_state.hw_logs = {}          # vm_id -> full trace string from last Auto-Optimize
+if 'var_results' not in st.session_state:
+    st.session_state.var_results = {}      # vm_id -> result dict from run_var_forecast
 
 
 def _invalidate_cv_if_seasonality_changed(vm_id, new_seasonality):
@@ -694,7 +696,21 @@ Example: Bursty / trend-driven VM
                             }])
                             display_df = pd.concat([display_df, sarima_row], ignore_index=True)
 
-                    # Recalculate winner across all models (including SARIMA)
+                    # ── Inject VAR row into leaderboard if available ─────────
+                    var_res_lb = st.session_state.var_results.get(selected_vm)
+                    if var_res_lb:
+                        _var_avg_vm = var_res_lb.get('val_metrics', {}).get('avg_cpu', {})
+                        if all(np.isfinite(_var_avg_vm.get(k, np.nan)) for k in ('RMSE', 'MAE', 'MAPE')):
+                            var_row = pd.DataFrame([{
+                                'Model':     'VAR (Systemic)',
+                                'RMSE':      _var_avg_vm['RMSE'],
+                                'MAE':       _var_avg_vm['MAE'],
+                                'MAPE':      _var_avg_vm['MAPE'],
+                                'is_winner': False,
+                            }])
+                            display_df = pd.concat([display_df, var_row], ignore_index=True)
+
+                    # Recalculate winner across all models (including VAR)
                     min_rmse = display_df['RMSE'].min()
                     display_df['is_winner'] = display_df['RMSE'] == min_rmse
                     display_df = display_df.sort_values('RMSE').reset_index(drop=True)
@@ -909,6 +925,17 @@ Example: Bursty / trend-driven VM
                     _hw_season_sm = _label_map[_hw_season_sel]
 
                     st.markdown("")
+                    # ── Box-Cox toggle ────────────────────────────────────────────
+                    _hw_boxcox = st.checkbox(
+                        "🔬 Enable Box-Cox Transformation",
+                        value=False,
+                        key=f"hw_boxcox_{selected_vm}",
+                        help=(
+                            "Applies Box-Cox variance-stabilisation before fitting. "
+                            "Helps when CPU residuals fan out (multiplicative error). "
+                            "Forecasts and metrics are back-transformed to original CPU % scale."
+                        ),
+                    )
                     _hw_btn1, _hw_btn2 = st.columns(2)
 
                     _do_hw_opt = _hw_btn1.button(
@@ -1007,6 +1034,7 @@ Example: Bursty / trend-driven VM
                     if _do_hw_run:
                         with st.spinner("Fitting Holt-Winters model (validation + final fit)…"):
                             try:
+                                _hw_boxcox = st.session_state.get(f"hw_boxcox_{selected_vm}", False)
                                 hw_result = run_holt_winters_forecast(
                                     series,
                                     trend=_hw_trend_sm,
@@ -1014,6 +1042,7 @@ Example: Bursty / trend-driven VM
                                     seasonal_periods=effective_seasonality,
                                     damped=_hw_damped,
                                     forecast_steps=int(_hw_steps),
+                                    use_boxcox=_hw_boxcox,
                                 )
                                 st.session_state.hw_results[selected_vm] = hw_result
                                 _prev_hw3 = st.session_state.hw_params.get(selected_vm, {})
@@ -1033,10 +1062,17 @@ Example: Bursty / trend-driven VM
                 if _cur_hw:
                     _hw_vm  = _cur_hw.get('val_metrics', {})
                     _hw_aic = _cur_hw.get('aic', float('nan'))
+                    _hw_bc_lam = _cur_hw.get('boxcox_lambda')
+                    _hw_bc_str = (
+                        f" · Box-Cox λ: **{_hw_bc_lam:.3f}**"
+                        + (" *(≈ linear — minimal effect)*" if _hw_bc_lam and abs(_hw_bc_lam - 1.0) < 0.15 else "")
+                        if _hw_bc_lam is not None else ""
+                    )
                     st.success(
                         f"✅ **{_cur_hw.get('model_label', 'HW')}** active · "
                         f"AIC: **{_hw_aic:.1f}** · "
                         f"Val RMSE: **{_hw_vm.get('RMSE', float('nan')):.3f}**"
+                        + _hw_bc_str
                     )
                     if st.button("🗑️ Clear HW Forecast", key=f"clear_hw_{selected_vm}"):
                         st.session_state.hw_results.pop(selected_vm, None)
@@ -1209,6 +1245,17 @@ Example: Bursty / trend-driven VM
                                 )
 
                         st.markdown("")
+                        # ── Box-Cox toggle ────────────────────────────────────────
+                        _sarima_boxcox = st.checkbox(
+                            "🔬 Enable Box-Cox Transformation",
+                            value=False,
+                            key=f"sarima_boxcox_{selected_vm}",
+                            help=(
+                                "Applies a Box-Cox variance-stabilisation transform before fitting. "
+                                "Helps when residuals show multiplicative heteroscedasticity. "
+                                "Forecasts and metrics are automatically back-transformed to original CPU % scale."
+                            ),
+                        )
                         # ── Buttons: side-by-side; all output renders full-width ──
                         _btn_col1, _btn_col2 = st.columns([1, 1])
                         _do_auto_opt = _btn_col1.button(
@@ -1371,6 +1418,7 @@ Example: Bursty / trend-driven VM
                                         seasonal_order=_seasonal_order,
                                         forecast_steps=int(forecast_steps),
                                         exog_df=_exog_input,
+                                        use_boxcox=_sarima_boxcox,
                                     )
                                     st.session_state.sarima_results[selected_vm] = result
                                     _prev_p = st.session_state.sarima_params.get(selected_vm, {})
@@ -1397,11 +1445,18 @@ Example: Bursty / trend-driven VM
                         _aic = _cur_sarima.get('aic', float('nan'))
                         # Use model_name from result if available ('ARIMAX' vs 'SARIMA')
                         _mn  = _cur_sarima.get('model_name', 'SARIMA')
+                        _bc_lam = _cur_sarima.get('boxcox_lambda')
+                        _bc_str = (
+                            f" · Box-Cox λ: **{_bc_lam:.3f}**"
+                            + (" *(≈ linear — minimal effect)*" if _bc_lam and abs(_bc_lam - 1.0) < 0.15 else "")
+                            if _bc_lam is not None else ""
+                        )
                         st.success(
                             f"✅ **{_mn}{_o}{_so}** active · "
                             f"AIC: **{_aic:.1f}** · "
                             f"Val RMSE: **{_vm.get('RMSE', float('nan')):.3f}** · "
                             f"Forecast: **{_cp.get('steps', '?')} steps** ahead"
+                            + _bc_str
                         )
                         st.caption(
                             "Shaded area represents the **95 % confidence interval**. "
@@ -1419,215 +1474,610 @@ Example: Bursty / trend-driven VM
                             st.rerun()
 
                 # ═══════════════════════════════════════════════════════════
-                # SECTION 7 — Universal Residual Diagnostics
+                # SECTION 7 — Multivariate System (VAR)
+                # ═══════════════════════════════════════════════════════════
+                st.divider()
+                VAR_COLOR_MAP = {
+                    'avg_cpu': '#3B82F6',    # blue-500
+                    'max_cpu': '#F97316',    # orange-500
+                    'min_cpu': '#10B981',    # emerald-500
+                }
+
+                st.subheader("🚀 Advanced Multivariate Statistical Forecasting (VAR)")
+
+                with st.expander("🚀 Advanced Multivariate Statistical Forecasting (VAR)", expanded=False):
+                    st.caption(
+                        "**Vector Autoregression (VAR)** treats `avg_cpu`, `max_cpu`, and `min_cpu` as a "
+                        "jointly-evolving system. Each variable is modelled as a linear function of *all* "
+                        "variables' past values. This captures cross-metric dynamics that no univariate "
+                        "model can detect — e.g., whether a spike in `max_cpu` at t−1 predicts "
+                        "`avg_cpu` at t. Lag order **p** is selected automatically by AIC."
+                    )
+
+                    # ── Stationarity info box ─────────────────────────────────────
+                    st.info(
+                        "🔬 **Auto-Stationarity:** Before fitting, an iterative ADF loop tests d ∈ {0, 1, 2}. "
+                        "The minimum d where all three series are stationary is chosen; "
+                        "forecasts are re-integrated back to original levels automatically."
+                    )
+
+                    # ── Box-Cox toggle ────────────────────────────────────────────
+                    _var_boxcox = st.checkbox(
+                        "🔬 Enable Box-Cox Transformation",
+                        value=False,
+                        key=f"var_boxcox_{selected_vm}",
+                        help=(
+                            "Applies per-column Box-Cox transforms (individual λ per variable) "
+                            "before fitting to stabilise variance. "
+                            "Applied BEFORE differencing; inverse-transformed AFTER re-integration. "
+                            "Forecasts and metrics are returned on the original CPU % scale."
+                        ),
+                    )
+
+                    # ── Horizon slider + execute button ───────────────────────────
+                    _var_horizon_max = min(288 if granularity_arg == '5-min' else 24 * 7, len(series) // 4)
+                    _var_steps = st.slider(
+                        "Forecast Horizon (steps)", min_value=6,
+                        max_value=max(_var_horizon_max, 12),
+                        value=min(48, len(series) // 5),
+                        key=f"var_horizon_{selected_vm}",
+                    )
+
+                    _do_var = st.button(
+                        "⚡ Execute System-wide VAR Forecast",
+                        type="primary",
+                        key=f"var_exec_{selected_vm}",
+                    )
+
+                    if _do_var:
+                        with st.spinner("Fitting VAR: ADF pre-check → lag selection → validation → final fit…"):
+                            try:
+                                _var_res = run_var_forecast(
+                                    vm_df,
+                                    forecast_steps=int(_var_steps),
+                                    use_boxcox=_var_boxcox,
+                                )
+                                st.session_state.var_results[selected_vm] = _var_res
+                                st.rerun()
+                            except Exception as _ve:
+                                st.error(f"VAR failed: {_ve}")
+
+                # ── VAR results — rendered outside the expander widget ────────────
+                # (so the charts are always visible when a result is cached)
+                _cur_var = st.session_state.var_results.get(selected_vm)
+                if _cur_var:
+                    _var_lag   = _cur_var['lag_order']
+                    _var_diff  = _cur_var['diff_order']
+                    _var_aic   = _cur_var['aic']
+                    _var_adfs  = _cur_var['adf_pvalues']
+
+                    # ── Status banner — Model Identity style (mirrors SARIMA banner) ──────
+                    _var_bc_lams = _cur_var.get('boxcox_lambdas')
+                    _var_bc_str  = (
+                        f" · Box-Cox λ: **{_var_bc_lams['avg_cpu']:.2f}**"
+                        f"/**{_var_bc_lams['max_cpu']:.2f}**"
+                        f"/**{_var_bc_lams['min_cpu']:.2f}**"
+                        if _var_bc_lams else " · Box-Cox λ: —"
+                    )
+                    st.success(
+                        f"✅ **VAR(p={_var_lag})** active · "
+                        f"System stationary at d=**{_var_diff}** · "
+                        + _var_bc_str
+                        + f" · AIC: **{_var_aic:.2f}**"
+                    )
+
+                    # ── VAR Master Chart ────────────────────────────────────────────
+                    st.subheader("📈 VAR System Forecast")
+                    st.caption(
+                        "Historical (`avg_cpu` shown as reference) + simultaneous 3-variable forecast. "
+                        "Bold lines = forecast horizon; thin lines = historical. "
+                        "Toggle any variable via the legend."
+                    )
+                    _fig_var = go.Figure()
+
+                    # Historical avg_cpu as anchor reference
+                    _fig_var.add_trace(go.Scatter(
+                        x=vm_df['timestamp_dt'], y=vm_df['avg_cpu'],
+                        name='avg_cpu (hist)', mode='lines',
+                        line=dict(color=VAR_COLOR_MAP['avg_cpu'], width=1, dash='dot'),
+                        opacity=0.45,
+                        hovertemplate='%{x|%b %d %H:%M}<br>avg_cpu: %{y:.1f}%<extra>Historical</extra>'
+                    ))
+
+                    # Validation window overlays (hold-out actual vs predicted)
+                    for _vcol, _vc_color in VAR_COLOR_MAP.items():
+                        _vp_var = _cur_var['val_predictions'].get(_vcol, pd.Series(dtype=float))
+                        if not _vp_var.empty:
+                            _fig_var.add_trace(go.Scatter(
+                                x=_vp_var.index, y=_vp_var.values,
+                                name=f'{_vcol} (val)',
+                                mode='lines',
+                                line=dict(color=_vc_color, width=1.5, dash='dashdot'),
+                                visible='legendonly',
+                                hovertemplate=f'%{{x|%b %d %H:%M}}<br>{_vcol}: %{{y:.1f}}%<extra>{_vcol} val</extra>'
+                            ))
+
+                    # Future forecasts — 3 bold lines
+                    for _vcol, _vc_color in VAR_COLOR_MAP.items():
+                        _fc_s = _cur_var['forecasts'][_vcol]
+                        _fig_var.add_trace(go.Scatter(
+                            x=_fc_s.index, y=_fc_s.values,
+                            name=f'{_vcol} (forecast)',
+                            mode='lines',
+                            line=dict(color=_vc_color, width=2.5),
+                            visible=True,
+                            hovertemplate=f'%{{x|%b %d %H:%M}}<br>{_vcol}: %{{y:.1f}}%<extra>{_vcol} fc</extra>'
+                        ))
+
+                    _var_y_all = np.concatenate([
+                        vm_df['avg_cpu'].dropna().values,
+                        *[_cur_var['forecasts'][c].values for c in VAR_COLOR_MAP]
+                    ])
+                    _var_y_range, _ = _y_range_robust(pd.Series(_var_y_all))
+                    _fig_var.update_layout(
+                        title=dict(text=f"VAR({_var_lag}) System Forecast — {selected_vm[:32]}", font=dict(size=14)),
+                        template='plotly_white',
+                        height=420,
+                        margin=dict(l=10, r=10, t=50, b=10),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1),
+                        yaxis=dict(title='CPU (%)', range=_var_y_range, fixedrange=False),
+                        xaxis=dict(fixedrange=False),
+                        hovermode='x unified',
+                    )
+                    st.plotly_chart(_fig_var, width='stretch')
+
+                    # ── Per-variable metric row (RMSE / MAE) ────────────────────────────
+                    st.markdown("**Validation Metrics (80/20 hold-out)**")
+                    _mc1, _mc2, _mc3 = st.columns(3)
+                    for _mc_col, _mc_container, _mc_emoji, _mc_color_label in [
+                        ('avg_cpu', _mc1, '🔵', 'Avg CPU'),
+                        ('max_cpu', _mc2, '🟠', 'Max CPU'),
+                        ('min_cpu', _mc3, '🟢', 'Min CPU'),
+                    ]:
+                        _mc_m = _cur_var['val_metrics'][_mc_col]
+                        _mc_rmse = _mc_m.get('RMSE', float('nan'))
+                        _mc_mae  = _mc_m.get('MAE',  float('nan'))
+                        _mc_mape = _mc_m.get('MAPE', float('nan'))
+                        with _mc_container:
+                            st.metric(
+                                label=f"{_mc_emoji} {_mc_color_label} — RMSE",
+                                value=f"{_mc_rmse:.3f}",
+                                help=f"MAE: {_mc_mae:.3f} · MAPE: {_mc_mape:.1f}%",
+                            )
+
+                    # ── ADF pre-check table ──────────────────────────────────────────
+                    st.caption(
+                        f"**ADF pre-check** — iterative loop tested d ∈ {{0, 1, 2}}; "
+                        f"chose d = **{_var_diff}** (minimum d where all series are stationary, p < 0.05). "
+                        "P-values shown below are from the **final chosen d**."
+                    )
+                    _adf_rows = []
+                    for _col, _pv in _var_adfs.items():
+                        _stat = '✅ Stationary' if _pv < 0.05 else '⚠️ Non-Stationary'
+                        _adf_rows.append({'Variable': _col, 'ADF p-value': f'{_pv:.4f}', 'Status': _stat})
+                    st.dataframe(pd.DataFrame(_adf_rows), hide_index=True, width='stretch')
+
+                    # ── Granger Causality toggle + matrix ────────────────────────────
+                    st.divider()
+                    _show_granger = st.toggle(
+                        "🔍 Show Granger Causality Matrix",
+                        value=False,
+                        key=f"granger_toggle_{selected_vm}",
+                        help=(
+                            "F-test for Granger causality: does knowing variable X at lags 1…p "
+                            "improve the prediction of Y beyond Y's own history? "
+                            "p < 0.05 → significant lead-lag relationship."
+                        ),
+                    )
+
+                    if _show_granger:
+                        st.subheader("🔗 Granger Causality Matrix")
+                        st.caption(
+                            f"F-test at α = 0.05 · VAR({_var_lag}) fitted on "
+                            + ("first-differenced" if _var_diff == 1 else "level") +
+                            " data. **Significant** = p < 0.05 → the cause variable's "
+                            "past values provide statistically useful information for "
+                            "predicting the effect variable."
+                        )
+
+                        _gc = _cur_var['granger']
+                        _gc_rows = []
+                        for _pair_key, _gc_val in _gc.items():
+                            _cause, _effect = _pair_key.split('→')
+                            _gc_p = _gc_val['p_value']
+                            _gc_sig = _gc_val['significant']
+                            _gc_rows.append({
+                                'Cause (X)':   _cause,
+                                'Effect (Y)':  _effect,
+                                'F-test p':    f"{_gc_p:.4f}" if np.isfinite(_gc_p) else 'N/A',
+                                'Significant': '✅ Yes' if _gc_sig else '❌ No',
+                                'Interpretation': (
+                                    f"`{_cause}` lags Granger-cause `{_effect}`"
+                                    if _gc_sig else
+                                    f"No evidence `{_cause}` leads `{_effect}`"
+                                ),
+                            })
+
+                        _gc_df = pd.DataFrame(_gc_rows)
+
+                        def _style_granger(row):
+                            if row['Significant'] == '✅ Yes':
+                                return ['background-color: #F0FDF4; color: #15803D'] * len(row)
+                            return [''] * len(row)
+
+                        _gc_styled = (
+                            _gc_df.style
+                            .apply(_style_granger, axis=1)
+                            .hide(axis='index')
+                        )
+                        st.dataframe(_gc_styled, width='stretch')
+
+                    # ── Clear VAR Forecast — column-aligned (mirrors SARIMA/HW pattern) ──
+                    st.divider()
+                    _var_clear_col, _ = st.columns([1, 3])
+                    if _var_clear_col.button(
+                        "🗑️ Clear VAR Forecast",
+                        key=f"clear_var_{selected_vm}",
+                    ):
+                        st.session_state.var_results.pop(selected_vm, None)
+                        st.rerun()
+
+                # ═══════════════════════════════════════════════════════════
+                # SECTION 8 — Unified Residual Diagnostics
                 # ═══════════════════════════════════════════════════════════
                 _cur_hw_rd     = st.session_state.hw_results.get(selected_vm)
                 _cur_sarima_rd = st.session_state.sarima_results.get(selected_vm)
+                _cur_var_rd    = st.session_state.var_results.get(selected_vm)
 
-                if _cur_hw_rd or _cur_sarima_rd:
+                if _cur_hw_rd or _cur_sarima_rd or _cur_var_rd:
                     st.divider()
                     st.subheader("🧪 Residual Diagnostics")
                     st.caption(
-                        "📊 **Source: out-of-sample hold-out errors** (actual − ŷ on the 20 % test window). "
-                        "These are harder to pass than in-sample residuals, making them a more honest "
-                        "measure of model adequacy. A well-fitted model leaves them as white noise: "
-                        "no autocorrelation, near-zero mean, approximately normal distribution. "
-                        "Select a model tab to explore."
+                        "Unified post-model residual analysis across all active models. "
+                        "**Univariate (HW / SARIMA / ARIMAX):** source = out-of-sample hold-out errors "
+                        "(actual − ŷ on the 20 % test window) — a strict, honest measure of adequacy. "
+                        "**VAR (Multivariate):** source = in-sample fit residuals from the VAR equation "
+                        "system — select a variable sub-tab to inspect each equation independently. "
+                        "A well-specified model leaves residuals as white noise: "
+                        "no autocorrelation, near-zero mean, approximately normal distribution."
                     )
 
-                    # Build a tab per active model
+                    # Build typed model list: (display_name, result_dict, model_class)
+                    # model_class ∈ {'univariate', 'var'}
+                    # Session-state presence is the sole dispatch mechanism —
+                    # clearing any forecast automatically removes it from this section.
                     _active_models = []
                     if _cur_hw_rd:
-                        _active_models.append(('HW', _cur_hw_rd))
+                        _active_models.append(('HW', _cur_hw_rd, 'univariate'))
                     if _cur_sarima_rd:
-                        # Use the stored model_name ('ARIMAX', 'SARIMAX', 'SARIMA', 'ARIMA')
-                        # so the tab label tracks the last-executed model variant.
                         _s_tab_name = _cur_sarima_rd.get('model_name', 'SARIMA')
-                        _active_models.append((_s_tab_name, _cur_sarima_rd))
+                        _active_models.append((_s_tab_name, _cur_sarima_rd, 'univariate'))
+                    if _cur_var_rd:
+                        _var_p_label = _cur_var_rd.get('lag_order', '?')
+                        _active_models.append((f'VAR({_var_p_label})', _cur_var_rd, 'var'))
 
-                    _rd_tabs = st.tabs([f"📊 {name}" for name, _ in _active_models])
+                    _rd_tabs = st.tabs([f"📊 {name}" for name, _, _ in _active_models])
 
-                    for _rd_tab, (_model_name, _model_res) in zip(_rd_tabs, _active_models):
+
+                    for _rd_tab, (_model_name, _model_res, _model_class) in zip(_rd_tabs, _active_models):
                         with _rd_tab:
-                            # ── Compute residuals ───────────────────────────
-                            _vp_rd  = _model_res.get('val_predictions', pd.Series(dtype=float))
-                            _vr_raw = _model_res.get('val_residuals',   None)
 
-                            if _vr_raw is not None and not _vr_raw.empty:
-                                _resid = _vr_raw.dropna()
-                            elif not _vp_rd.empty:
-                                # SARIMA doesn't store val_residuals; compute on the fly
-                                _test_start = _vp_rd.index[0]
-                                _actuals_rd = series.loc[_test_start:_vp_rd.index[-1]]
-                                _resid = (_actuals_rd - _vp_rd).dropna()
+                            # ══════════════════════════════════════════════
+                            # VAR path — in-sample equation residuals
+                            # ══════════════════════════════════════════════
+                            if _model_class == 'var':
+                                from statsmodels.stats.diagnostic import acorr_ljungbox as _lb_fn_var
+                                _vd_resid_df   = _model_res['var_residuals']
+                                _vd_lag        = _model_res.get('lag_order', '?')
+                                _vd_diff       = _model_res.get('diff_order', 0)
+                                st.info(
+                                    f"🔎 **VAR({_vd_lag}) in-sample equation residuals** "
+                                    + ("— fitted on **first-differences (Δ)**, displayed in diff-domain. "
+                                       if _vd_diff == 1 else "— fitted in **levels**. ")
+                                    + "Select a variable equation below."
+                                )
+
+                                # ── Variable sub-tabs ──────────────────────
+                                _vd_tabs = st.tabs([
+                                    f"{'🔵' if c == 'avg_cpu' else '🟠' if c == 'max_cpu' else '🟢'} {c}"
+                                    for c in VAR_COLOR_MAP
+                                ])
+                                for _vd_tab, (_vd_col, _vd_color) in zip(_vd_tabs, VAR_COLOR_MAP.items()):
+                                    with _vd_tab:
+                                        _vd_resid = _vd_resid_df[_vd_col].dropna()
+                                        if len(_vd_resid) < 4:
+                                            st.info("Not enough residual observations.")
+                                            continue
+
+                                        # LB slider
+                                        _vd_lb_max = max(5, min(len(_vd_resid) // 5, 50))
+                                        _vd_lb_def = min(10, _vd_lb_max)
+                                        _vd_lb_sel = st.slider(
+                                            "Ljung-Box Test — Number of Lags",
+                                            min_value=1, max_value=_vd_lb_max,
+                                            value=_vd_lb_def,
+                                            key=f"lb_lags_{selected_vm}_{_model_name}_{_vd_col}",
+                                            help=(
+                                                f"Tests residual autocorrelation for the `{_vd_col}` "
+                                                "equation. p < 0.05 → consider a higher VAR lag order."
+                                            ),
+                                        )
+                                        _vd_lb_res = _lb_fn_var(_vd_resid, lags=[_vd_lb_sel], return_df=True)
+                                        _vd_lb_p   = float(_vd_lb_res['lb_pvalue'].iloc[0])
+                                        _vd_p_str  = f"{_vd_lb_p:.4f}" if _vd_lb_p >= 0.0001 else f"{_vd_lb_p:.2e}"
+
+                                        if _vd_lb_p > 0.05:
+                                            st.success(
+                                                f"✅ **`{_vd_col}` equation residuals are white noise** — "
+                                                f"Ljung-Box p = {_vd_p_str} > 0.05 (at lag **{_vd_lb_sel}**). "
+                                                "VAR equation is well-specified for this variable."
+                                            )
+                                        else:
+                                            st.warning(
+                                                f"⚠️ **`{_vd_col}` residuals NOT white noise** — "
+                                                f"Ljung-Box p = {_vd_p_str} < 0.05 (at lag **{_vd_lb_sel}**). "
+                                                "Consider a higher lag order `p` for the VAR system."
+                                            )
+
+                                        # ── 3-panel chart ──────────────────
+                                        _vd_c1, _vd_c2, _vd_c3 = st.columns(3)
+
+                                        with _vd_c1:
+                                            _fig_vd = go.Figure(go.Scatter(
+                                                y=_vd_resid.values, mode='lines',
+                                                line=dict(color=_vd_color, width=1),
+                                                name='Residual',
+                                            ))
+                                            _fig_vd.add_hline(y=0, line_dash='dash',
+                                                              line_color='#EF4444', opacity=0.6)
+                                            _fig_vd.update_layout(
+                                                title=f'{_vd_col} — Residuals vs Time',
+                                                template='plotly_white', height=280,
+                                                margin=dict(l=5, r=5, t=36, b=5),
+                                                yaxis=dict(fixedrange=True),
+                                                xaxis=dict(fixedrange=True, title='Fitted step'),
+                                                showlegend=False,
+                                            )
+                                            st.plotly_chart(_fig_vd, width='stretch')
+
+                                        with _vd_c2:
+                                            _vd_nlags  = min(40, max(len(_vd_resid) // 2 - 1, 4))
+                                            _vd_acf    = sm_acf(_vd_resid, nlags=_vd_nlags)
+                                            _vd_colors = ['#EF4444' if abs(v) > 0.2 else '#94A3B8'
+                                                          for v in _vd_acf]
+                                            _fig_vd_acf = go.Figure(go.Bar(
+                                                x=list(range(len(_vd_acf))), y=_vd_acf,
+                                                marker_color=_vd_colors, name='Residual ACF',
+                                            ))
+                                            _fig_vd_acf.add_vrect(
+                                                x0=0.5, x1=min(_vd_lb_sel, _vd_nlags) + 0.5,
+                                                fillcolor='rgba(99,102,241,0.08)',
+                                                layer='below', line_width=0,
+                                                annotation_text=f"LB window (lag {_vd_lb_sel})",
+                                                annotation_position='top left',
+                                                annotation=dict(font=dict(size=9, color='#6366F1'),
+                                                                showarrow=False),
+                                            )
+                                            _fig_vd_acf.add_vline(
+                                                x=min(_vd_lb_sel, _vd_nlags) + 0.5,
+                                                line_dash='dot', line_color='#6366F1',
+                                                line_width=1.5, opacity=0.7,
+                                            )
+                                            _fig_vd_acf.add_hline(y=0.2,  line_dash='dash',
+                                                                   line_color='#EF4444', opacity=0.5)
+                                            _fig_vd_acf.add_hline(y=-0.2, line_dash='dash',
+                                                                   line_color='#EF4444', opacity=0.5)
+                                            _fig_vd_acf.update_layout(
+                                                title=f'{_vd_col} — Residual ACF (LB up to lag {_vd_lb_sel})',
+                                                template='plotly_white', height=280,
+                                                margin=dict(l=5, r=5, t=36, b=5),
+                                                xaxis=dict(title='Lag', fixedrange=True),
+                                                yaxis=dict(title='ACF', fixedrange=True),
+                                                showlegend=False,
+                                            )
+                                            st.plotly_chart(_fig_vd_acf, width='stretch')
+
+                                        with _vd_c3:
+                                            _vd_vals = _vd_resid.values
+                                            _vd_std  = float(np.std(_vd_vals))
+                                            _vd_bw   = 1.06 * _vd_std * len(_vd_vals) ** (-0.2) if _vd_std > 0 else 1.0
+                                            _vd_grid = np.linspace(_vd_vals.min(), _vd_vals.max(), 200)
+                                            _vd_kde  = np.sum(
+                                                np.exp(-0.5 * ((_vd_grid[:, None] - _vd_vals[None, :]) / _vd_bw) ** 2),
+                                                axis=1,
+                                            ) / (len(_vd_vals) * _vd_bw * np.sqrt(2 * np.pi))
+                                            _vd_kde_sc = _vd_kde * len(_vd_vals) * (
+                                                (_vd_vals.max() - _vd_vals.min()) / 20
+                                            )
+                                            _fig_vd_hist = go.Figure()
+                                            _fig_vd_hist.add_trace(go.Histogram(
+                                                x=_vd_vals, nbinsx=20,
+                                                marker_color=_vd_color, opacity=0.7, name='Count',
+                                            ))
+                                            _fig_vd_hist.add_trace(go.Scatter(
+                                                x=_vd_grid, y=_vd_kde_sc,
+                                                mode='lines', line=dict(color='#EF4444', width=2),
+                                                name='KDE',
+                                            ))
+                                            _fig_vd_hist.update_layout(
+                                                title=f'{_vd_col} — Residual Distribution',
+                                                template='plotly_white', height=280,
+                                                margin=dict(l=5, r=5, t=36, b=5),
+                                                xaxis=dict(title='Residual', fixedrange=True),
+                                                yaxis=dict(title='Count', fixedrange=True),
+                                                showlegend=False, barmode='overlay',
+                                            )
+                                            st.plotly_chart(_fig_vd_hist, width='stretch')
+
+                            # ══════════════════════════════════════════════
+                            # Univariate path (HW / SARIMA / ARIMA / ARIMAX)
+                            # Source: hold-out OOS errors (actual − ŷ)
+                            # ══════════════════════════════════════════════
                             else:
-                                st.info("Run the model to compute residuals.")
-                                continue
+                                _vp_rd  = _model_res.get('val_predictions', pd.Series(dtype=float))
+                                _vr_raw = _model_res.get('val_residuals',   None)
 
-                            if len(_resid) < 4:
-                                st.info("Not enough hold-out data to compute residuals.")
-                                continue
+                                if _vr_raw is not None and not _vr_raw.empty:
+                                    _resid = _vr_raw.dropna()
+                                elif not _vp_rd.empty:
+                                    _test_start = _vp_rd.index[0]
+                                    _actuals_rd = series.loc[_test_start:_vp_rd.index[-1]]
+                                    _resid = (_actuals_rd - _vp_rd).dropna()
+                                else:
+                                    st.info("Run the model to compute residuals.")
+                                    continue
 
-                            # ── Ljung-Box lag slider + test ──────────────────────────────────
-                            # Max lags: floor 5, cap 50 to avoid computation blow-up
-                            _lb_max = max(5, min(len(_resid) // 5, 50))
-                            # Smart default: 2 seasonal cycles when periodic; 10 for aperiodic
-                            _lb_def = (
-                                min(2 * effective_seasonality, _lb_max)
-                                if effective_seasonality > 1
-                                else min(10, _lb_max)
-                            )
+                                if len(_resid) < 4:
+                                    st.info("Not enough hold-out data to compute residuals.")
+                                    continue
 
-                            _lb_sel = st.slider(
-                                "Ljung-Box Test — Number of Lags",
-                                min_value=1,
-                                max_value=_lb_max,
-                                value=_lb_def,
-                                key=f"lb_lags_{selected_vm}_{_model_name}",
-                                help=(
-                                    "Tests whether residual autocorrelations up to the chosen lag "
-                                    "are jointly zero (white noise). "
-                                    f"Default = **{_lb_def}** "
-                                    f"({'2 × s = ' + str(2 * effective_seasonality) if effective_seasonality > 1 else 'aperiodic default'}). "
-                                    "Higher lags catch long-range structure but reduce statistical power."
-                                ),
-                            )
-
-                            from statsmodels.stats.diagnostic import acorr_ljungbox
-                            _lb_res = acorr_ljungbox(_resid, lags=[_lb_sel], return_df=True)
-                            _lb_p   = float(_lb_res['lb_pvalue'].iloc[0])
-                            _p_str  = f"{_lb_p:.4f}" if _lb_p >= 0.0001 else f"{_lb_p:.2e}"
-
-                            st.info(
-                                f"🔎 **Currently analyzing residuals for: `{_model_name}`** — "
-                                f"{len(_resid)} out-of-sample observations (actual − predicted)."
-                            )
-
-                            if _lb_p > 0.05:
-                                st.success(
-                                    f"✅ **Residuals are white noise** — "
-                                    f"Ljung-Box p = {_p_str} > 0.05 (at lag **{_lb_sel}**). "
-                                    f"No autocorrelation structure remains in `{_model_name}` residuals. "
-                                    "Model is well-specified."
+                                # LB slider
+                                _lb_max = max(5, min(len(_resid) // 5, 50))
+                                _lb_def = (
+                                    min(2 * effective_seasonality, _lb_max)
+                                    if effective_seasonality > 1
+                                    else min(10, _lb_max)
                                 )
-                            else:
-                                _lb_note = (
-                                    f" For high-seasonality VMs (s = {effective_seasonality}), "
-                                    "p ≈ 0 is expected — even a well-fitted SARIMA rarely captures "
-                                    "all seasonal harmonics in a short hold-out window. "
-                                    "Try reducing the lag count to focus on short-range structure."
-                                    if _lb_p < 0.001 else ""
-                                )
-                                st.warning(
-                                    f"⚠️ **Residuals are NOT white noise** — "
-                                    f"Ljung-Box p = {_p_str} < 0.05 (at lag **{_lb_sel}**). "
-                                    f"The `{_model_name}` model has not captured all structure. "
-                                    f"Consider adjusting parameters.{_lb_note}"
-                                )
-
-                            # ── 3-panel chart ────────────────────────────────
-                            _rd_c1, _rd_c2, _rd_c3 = st.columns(3)
-
-                            # Panel 1: Residuals vs Time
-                            with _rd_c1:
-                                _fig_r = go.Figure(go.Scatter(
-                                    y=_resid.values, mode='lines',
-                                    line=dict(color='#64748B', width=1),
-                                    name='Residual',
-                                ))
-                                _fig_r.add_hline(y=0, line_dash='dash',
-                                                 line_color='#EF4444', opacity=0.6)
-                                _fig_r.update_layout(
-                                    title='Residuals vs Time',
-                                    template='plotly_white', height=280,
-                                    margin=dict(l=5, r=5, t=36, b=5),
-                                    yaxis=dict(fixedrange=True),
-                                    xaxis=dict(fixedrange=True, title='Hold-out step'),
-                                    showlegend=False,
-                                )
-                                st.plotly_chart(_fig_r, width='stretch')
-
-                            # Panel 2: Residual ACF
-                            # ACF of residuals isolates any remaining autocorrelation.
-                            # Significant bars (|ACF| > 0.2) indicate the model missed
-                            # structure — e.g. a seasonal harmonic or a MA term.
-                            # A vertical highlight marks the Ljung-Box test window.
-                            with _rd_c2:
-                                _r_nlags  = min(40, len(_resid) // 2 - 1)
-                                _r_nlags  = max(_r_nlags, 4)
-                                _r_acf    = sm_acf(_resid, nlags=_r_nlags)
-                                _r_lags   = list(range(len(_r_acf)))
-                                _r_colors = ['#EF4444' if abs(v) > 0.2 else '#94A3B8'
-                                             for v in _r_acf]
-                                _fig_acf  = go.Figure(go.Bar(
-                                    x=_r_lags, y=_r_acf,
-                                    marker_color=_r_colors, name='Residual ACF',
-                                ))
-                                # ── LB test window highlight ──────────────────
-                                _fig_acf.add_vrect(
-                                    x0=0.5, x1=min(_lb_sel, _r_nlags) + 0.5,
-                                    fillcolor='rgba(99,102,241,0.08)',
-                                    layer='below', line_width=0,
-                                    annotation_text=f"LB window (lag {_lb_sel})",
-                                    annotation_position='top left',
-                                    annotation=dict(
-                                        font=dict(size=9, color='#6366F1'),
-                                        showarrow=False,
+                                _lb_sel = st.slider(
+                                    "Ljung-Box Test — Number of Lags",
+                                    min_value=1, max_value=_lb_max, value=_lb_def,
+                                    key=f"lb_lags_{selected_vm}_{_model_name}",
+                                    help=(
+                                        "Tests whether residual autocorrelations up to the chosen lag "
+                                        "are jointly zero (white noise). "
+                                        f"Default = **{_lb_def}** "
+                                        f"({'2 × s = ' + str(2 * effective_seasonality) if effective_seasonality > 1 else 'aperiodic default'}). "
+                                        "Higher lags catch long-range structure but reduce statistical power."
                                     ),
                                 )
-                                _fig_acf.add_vline(
-                                    x=min(_lb_sel, _r_nlags) + 0.5,
-                                    line_dash='dot', line_color='#6366F1',
-                                    line_width=1.5, opacity=0.7,
-                                )
-                                _fig_acf.add_hline(y=0.2,  line_dash='dash',
-                                                   line_color='#EF4444', opacity=0.5)
-                                _fig_acf.add_hline(y=-0.2, line_dash='dash',
-                                                   line_color='#EF4444', opacity=0.5)
-                                _fig_acf.update_layout(
-                                    title=f'Residual ACF (LB up to lag {_lb_sel})',
-                                    template='plotly_white', height=280,
-                                    margin=dict(l=5, r=5, t=36, b=5),
-                                    xaxis=dict(title='Lag', fixedrange=True),
-                                    yaxis=dict(title='ACF', fixedrange=True),
-                                    showlegend=False,
-                                )
-                                st.plotly_chart(_fig_acf, width='stretch')
 
-                            # Panel 3: Normality — histogram + KDE overlay
-                            with _rd_c3:
-                                _r_vals = _resid.values
-                                _r_std  = float(np.std(_r_vals))
-                                _r_mean = float(np.mean(_r_vals))
-                                # KDE via Gaussian kernel evaluated on a fine grid
-                                _grid   = np.linspace(_r_vals.min(), _r_vals.max(), 200)
-                                _bw     = 1.06 * _r_std * len(_r_vals) ** (-0.2) if _r_std > 0 else 1.0
-                                _kde    = np.sum(
-                                    np.exp(-0.5 * ((_grid[:, None] - _r_vals[None, :]) / _bw) ** 2),
-                                    axis=1,
-                                ) / (len(_r_vals) * _bw * np.sqrt(2 * np.pi))
-                                _kde_scaled = _kde * len(_r_vals) * (
-                                    (_r_vals.max() - _r_vals.min()) / 20
-                                )  # scale to histogram count
-                                _fig_hist = go.Figure()
-                                _fig_hist.add_trace(go.Histogram(
-                                    x=_r_vals, nbinsx=20,
-                                    marker_color='#94A3B8', opacity=0.7, name='Count',
-                                ))
-                                _fig_hist.add_trace(go.Scatter(
-                                    x=_grid, y=_kde_scaled,
-                                    mode='lines', line=dict(color='#EF4444', width=2),
-                                    name='KDE',
-                                ))
-                                _fig_hist.update_layout(
-                                    title='Residual Distribution',
-                                    template='plotly_white', height=280,
-                                    margin=dict(l=5, r=5, t=36, b=5),
-                                    xaxis=dict(title='Residual', fixedrange=True),
-                                    yaxis=dict(title='Count', fixedrange=True),
-                                    showlegend=False, barmode='overlay',
+                                from statsmodels.stats.diagnostic import acorr_ljungbox
+                                _lb_res = acorr_ljungbox(_resid, lags=[_lb_sel], return_df=True)
+                                _lb_p   = float(_lb_res['lb_pvalue'].iloc[0])
+                                _p_str  = f"{_lb_p:.4f}" if _lb_p >= 0.0001 else f"{_lb_p:.2e}"
+
+                                st.info(
+                                    f"🔎 **Currently analyzing residuals for: `{_model_name}`** — "
+                                    f"{len(_resid)} out-of-sample observations (actual − predicted)."
                                 )
-                                st.plotly_chart(_fig_hist, width='stretch')
+
+                                if _lb_p > 0.05:
+                                    st.success(
+                                        f"✅ **Residuals are white noise** — "
+                                        f"Ljung-Box p = {_p_str} > 0.05 (at lag **{_lb_sel}**). "
+                                        f"No autocorrelation structure remains in `{_model_name}` residuals. "
+                                        "Model is well-specified."
+                                    )
+                                else:
+                                    _lb_note = (
+                                        f" For high-seasonality VMs (s = {effective_seasonality}), "
+                                        "p ≈ 0 is expected — even a well-fitted SARIMA rarely captures "
+                                        "all seasonal harmonics in a short hold-out window. "
+                                        "Try reducing the lag count to focus on short-range structure."
+                                        if _lb_p < 0.001 else ""
+                                    )
+                                    st.warning(
+                                        f"⚠️ **Residuals are NOT white noise** — "
+                                        f"Ljung-Box p = {_p_str} < 0.05 (at lag **{_lb_sel}**). "
+                                        f"The `{_model_name}` model has not captured all structure. "
+                                        f"Consider adjusting parameters.{_lb_note}"
+                                    )
+
+                                # ── 3-panel chart ──────────────────────────
+                                _rd_c1, _rd_c2, _rd_c3 = st.columns(3)
+
+                                with _rd_c1:
+                                    _fig_r = go.Figure(go.Scatter(
+                                        y=_resid.values, mode='lines',
+                                        line=dict(color='#64748B', width=1),
+                                        name='Residual',
+                                    ))
+                                    _fig_r.add_hline(y=0, line_dash='dash',
+                                                     line_color='#EF4444', opacity=0.6)
+                                    _fig_r.update_layout(
+                                        title='Residuals vs Time',
+                                        template='plotly_white', height=280,
+                                        margin=dict(l=5, r=5, t=36, b=5),
+                                        yaxis=dict(fixedrange=True),
+                                        xaxis=dict(fixedrange=True, title='Hold-out step'),
+                                        showlegend=False,
+                                    )
+                                    st.plotly_chart(_fig_r, width='stretch')
+
+                                with _rd_c2:
+                                    _r_nlags  = min(40, max(len(_resid) // 2 - 1, 4))
+                                    _r_acf    = sm_acf(_resid, nlags=_r_nlags)
+                                    _r_lags   = list(range(len(_r_acf)))
+                                    _r_colors = ['#EF4444' if abs(v) > 0.2 else '#94A3B8'
+                                                 for v in _r_acf]
+                                    _fig_acf  = go.Figure(go.Bar(
+                                        x=_r_lags, y=_r_acf,
+                                        marker_color=_r_colors, name='Residual ACF',
+                                    ))
+                                    _fig_acf.add_vrect(
+                                        x0=0.5, x1=min(_lb_sel, _r_nlags) + 0.5,
+                                        fillcolor='rgba(99,102,241,0.08)',
+                                        layer='below', line_width=0,
+                                        annotation_text=f"LB window (lag {_lb_sel})",
+                                        annotation_position='top left',
+                                        annotation=dict(
+                                            font=dict(size=9, color='#6366F1'),
+                                            showarrow=False,
+                                        ),
+                                    )
+                                    _fig_acf.add_vline(
+                                        x=min(_lb_sel, _r_nlags) + 0.5,
+                                        line_dash='dot', line_color='#6366F1',
+                                        line_width=1.5, opacity=0.7,
+                                    )
+                                    _fig_acf.add_hline(y=0.2,  line_dash='dash',
+                                                       line_color='#EF4444', opacity=0.5)
+                                    _fig_acf.add_hline(y=-0.2, line_dash='dash',
+                                                       line_color='#EF4444', opacity=0.5)
+                                    _fig_acf.update_layout(
+                                        title=f'Residual ACF (LB up to lag {_lb_sel})',
+                                        template='plotly_white', height=280,
+                                        margin=dict(l=5, r=5, t=36, b=5),
+                                        xaxis=dict(title='Lag', fixedrange=True),
+                                        yaxis=dict(title='ACF', fixedrange=True),
+                                        showlegend=False,
+                                    )
+                                    st.plotly_chart(_fig_acf, width='stretch')
+
+                                with _rd_c3:
+                                    _r_vals = _resid.values
+                                    _r_std  = float(np.std(_r_vals))
+                                    _grid   = np.linspace(_r_vals.min(), _r_vals.max(), 200)
+                                    _bw     = 1.06 * _r_std * len(_r_vals) ** (-0.2) if _r_std > 0 else 1.0
+                                    _kde    = np.sum(
+                                        np.exp(-0.5 * ((_grid[:, None] - _r_vals[None, :]) / _bw) ** 2),
+                                        axis=1,
+                                    ) / (len(_r_vals) * _bw * np.sqrt(2 * np.pi))
+                                    _kde_scaled = _kde * len(_r_vals) * (
+                                        (_r_vals.max() - _r_vals.min()) / 20
+                                    )
+                                    _fig_hist = go.Figure()
+                                    _fig_hist.add_trace(go.Histogram(
+                                        x=_r_vals, nbinsx=20,
+                                        marker_color='#94A3B8', opacity=0.7, name='Count',
+                                    ))
+                                    _fig_hist.add_trace(go.Scatter(
+                                        x=_grid, y=_kde_scaled,
+                                        mode='lines', line=dict(color='#EF4444', width=2),
+                                        name='KDE',
+                                    ))
+                                    _fig_hist.update_layout(
+                                        title='Residual Distribution',
+                                        template='plotly_white', height=280,
+                                        margin=dict(l=5, r=5, t=36, b=5),
+                                        xaxis=dict(title='Residual', fixedrange=True),
+                                        yaxis=dict(title='Count', fixedrange=True),
+                                        showlegend=False, barmode='overlay',
+                                    )
+                                    st.plotly_chart(_fig_hist, width='stretch')
+
+
+
 
             else:
                 st.info("ℹ️ Run **Fleet Diagnostics** in the Fleet Analytics tab first to unlock the Deep Dive.")
@@ -1636,4 +2086,4 @@ else:
     st.info("⏳ Awaiting data — upload a CSV or allow the demo dataset to load.")
 
 st.sidebar.divider()
-st.sidebar.info("v2.1 · Phase 3.3a · ARIMAX · Dynamic Labels")
+st.sidebar.info("v2.3 · Phase 3.3.5 · Unified Residual Diagnostics")

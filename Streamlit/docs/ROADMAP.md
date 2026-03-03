@@ -1,6 +1,6 @@
 # docs/ROADMAP.md
 
-## Project Status: 🚀 Phase 3 — Advanced Forecasting (3.1 DONE · 2.9 DONE · 2.9.5 DONE)
+## Project Status: 🚀 Phase 3 — Advanced Forecasting (3.3b DONE · 3.1 DONE · 2.9 DONE · 2.9.5 DONE)
 
 ---
 
@@ -73,6 +73,10 @@
     - Section 3 rewritten: `_is_aperiodic = (s <= 1)` branches to Aperiodic chart vs STL vs insufficient-data notice.
     - Section 5 SARIMA panel: `_aperiodic_arima = (s <= 1)` hides P/D/Q/s block; `_P,_D,_Q,_s = 0,0,0,0` injected silently.
     - Tab 1 Gatekeeper text: added Periodic/Aperiodic decision table and second example.
-- [ ] **3.2 Holt-Winters Exponential Smoothing:** Additive/multiplicative modes, AIC auto-fit, Leaderboard integration.
-- [ ] **3.3 Residual Diagnostics:** Post-modeling Ljung-Box and error distribution.
+- [x] **3.2 Holt-Winters Exponential Smoothing:** Additive/multiplicative modes, AIC auto-fit, Leaderboard integration. [✅ DONE Phase 3.2.5]
+- [x] **3.3 Residual Diagnostics:** Post-modeling Ljung-Box and error distribution. [✅ DONE Phase 3.3a (HW+SARIMA) included in existing sections]
+- [x] **3.3b VAR (Vector Autoregression) Multivariate System** ✅
+    - `utils/forecasting.py`: `run_var_forecast()` — ADF pre-check → auto differencing (d=0 or d=1) → AIC lag selection `select_order(maxlags=15)` → 80/20 validation → final 100% fit → Granger causality matrix (6 ordered pairs) → VAR residuals.
+    - `app.py`: Section 7 expander — ⚡ Execute VAR button, VAR Master Chart (3-line forecast), ADF pre-check table, Granger toggle + styled matrix, per-variable residual diagnostics (3-panel: time/ACF/hist), Clear button. Leaderboard row (avg_cpu RMSE for fair comparison). Session state: `var_results`.
+    - 10 new pytest tests — `TestRunVarForecast` → **60/60 passing (30.61s)**.
 - [ ] **3.4 Optimization Engine:** Capacity planning recommendations based on forecast peaks.

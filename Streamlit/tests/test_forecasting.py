@@ -13,7 +13,8 @@ import pandas as pd
 
 from utils.forecasting import (
     run_sarima_forecast, auto_optimize_sarima, run_holt_winters_forecast,
-    auto_optimize_holt_winters, build_exog_df,
+    auto_optimize_holt_winters, build_exog_df, run_var_forecast,
+    _BoxCoxLayer,
 )
 
 
@@ -336,3 +337,235 @@ class TestArimax:
                                       forecast_steps=12, exog_df=exog_df)
         rmse = result['val_metrics']['RMSE']
         assert np.isfinite(rmse) and rmse >= 0
+
+
+# ---------------------------------------------------------------------------
+# run_var_forecast tests  (Phase 3.3b)
+# ---------------------------------------------------------------------------
+
+VAR_COLS = ['avg_cpu', 'max_cpu', 'min_cpu']
+FORECAST_STEPS = 12
+
+
+@pytest.fixture(scope="module")
+def synthetic_vm_df_for_var():
+    """200-row vm_df with timestamp_dt + avg/max/min columns, stationary-ish."""
+    np.random.seed(42)
+    n   = 200
+    idx = pd.date_range("2023-01-01", periods=n, freq="5min")
+    avg = 30 + 5 * np.sin(2 * np.pi * np.arange(n) / 12) + np.random.normal(0, 0.5, n)
+    mx  = avg + np.abs(np.random.normal(2, 0.4, n))
+    mn  = avg - np.abs(np.random.normal(2, 0.4, n))
+    return pd.DataFrame({'timestamp_dt': idx, 'avg_cpu': avg, 'max_cpu': mx, 'min_cpu': mn})
+
+
+@pytest.fixture(scope="module")
+def var_result(synthetic_vm_df_for_var):
+    """Run one VAR forecast shared across all TestRunVarForecast tests."""
+    return run_var_forecast(synthetic_vm_df_for_var, forecast_steps=FORECAST_STEPS)
+
+
+class TestRunVarForecast:
+
+    def test_returns_required_keys(self, var_result):
+        """Output dict must contain all documented keys."""
+        required = {
+            'forecasts', 'val_metrics', 'val_predictions',
+            'lag_order', 'diff_order', 'adf_pvalues',
+            'granger', 'var_residuals', 'aic',
+        }
+        assert required.issubset(var_result.keys())
+
+    def test_forecasts_has_all_variables(self, var_result):
+        """'forecasts' must contain a Series for each of the 3 variables."""
+        for col in VAR_COLS:
+            assert col in var_result['forecasts'], f"Missing forecast for {col}"
+            fc = var_result['forecasts'][col]
+            assert len(fc) == FORECAST_STEPS, (
+                f"{col} forecast length {len(fc)} != {FORECAST_STEPS}"
+            )
+
+    def test_forecast_index_is_datetimeindex(self, var_result):
+        """All three forecast Series must have a DatetimeIndex in the future."""
+        for col in VAR_COLS:
+            assert isinstance(var_result['forecasts'][col].index, pd.DatetimeIndex), (
+                f"{col} forecast index is not a DatetimeIndex"
+            )
+
+    def test_val_metrics_finite_and_non_negative(self, var_result):
+        """Validation metrics for every variable must be finite and ≥ 0."""
+        for col in VAR_COLS:
+            vm = var_result['val_metrics'][col]
+            for k in ('RMSE', 'MAE', 'MAPE'):
+                assert np.isfinite(vm[k]), f"{col}.{k} is not finite"
+                assert vm[k] >= 0,        f"{col}.{k} is negative"
+
+    def test_granger_matrix_exhaustive(self, var_result):
+        """Granger dict must contain exactly n*(n-1) = 6 ordered pairs."""
+        expected_pairs = {
+            f"{c}→{e}"
+            for c in VAR_COLS for e in VAR_COLS if c != e
+        }
+        assert set(var_result['granger'].keys()) == expected_pairs
+
+    def test_granger_entries_have_required_keys(self, var_result):
+        """Every Granger entry must have p_value, significant, max_lag."""
+        for key, entry in var_result['granger'].items():
+            for field in ('p_value', 'significant', 'max_lag'):
+                assert field in entry, f"Granger entry '{key}' missing '{field}'"
+
+    def test_var_residuals_shape(self, var_result):
+        """var_residuals must be a DataFrame with the 3 variable columns."""
+        resid = var_result['var_residuals']
+        assert isinstance(resid, pd.DataFrame)
+        for col in VAR_COLS:
+            assert col in resid.columns, f"Residuals missing column {col}"
+        # Residuals lose the first p rows (lag_order); must be > 0
+        assert len(resid) > 0
+
+    def test_diff_order_is_valid(self, var_result):
+        """diff_order must be 0, 1, or 2 (iterative ADF supports up to d=2)."""
+        assert var_result['diff_order'] in (0, 1, 2)
+
+    def test_auto_differencing_for_nonstationary_data(self, synthetic_vm_df_for_var):
+        """Force a non-stationary series by adding a strong trend;
+        diff_order must become 1 on the resulting data."""
+        df = synthetic_vm_df_for_var.copy()
+        # Add a steep trend so avg_cpu / max_cpu / min_cpu all fail ADF
+        trend = np.linspace(0, 200, len(df))
+        df['avg_cpu'] += trend
+        df['max_cpu'] += trend
+        df['min_cpu'] += trend
+        result = run_var_forecast(df, forecast_steps=6)
+        assert result['diff_order'] == 1, (
+            "Expected diff_order=1 for strongly trended data"
+        )
+
+    def test_short_series_raises_valueerror(self):
+        """DataFrames with fewer than 30 rows must raise ValueError."""
+        idx = pd.date_range("2023-01-01", periods=20, freq="5min")
+        df  = pd.DataFrame({
+            'timestamp_dt': idx,
+            'avg_cpu': np.random.rand(20),
+            'max_cpu': np.random.rand(20),
+            'min_cpu': np.random.rand(20),
+        })
+        with pytest.raises(ValueError, match="30"):
+            run_var_forecast(df, forecast_steps=5)
+
+    def test_auto_differencing_v2(self, synthetic_vm_df_for_var):
+        """
+        test_auto_differencing_v2
+        --------------------------
+        Build an I(2) system (cumsum of cumsum of noise) so that a single
+        difference is insufficient for stationarity; the engine must apply d=2.
+
+        Assertions
+        ----------
+        1. diff_order == 2  (two differences were required)
+        2. All three forecast Series are finite  (no NaN/Inf after d=2 re-integration)
+        3. Forecast index is strictly after the last historical timestamp.
+        """
+        rng = np.random.default_rng(7)
+        n   = 150
+        idx = pd.date_range("2023-01-01", periods=n, freq="5min")
+
+        # I(2) process: cumsum of cumsum of noise (mean-corrected to avoid sign flip)
+        noise  = rng.normal(0, 0.3, n)
+        level1 = np.cumsum(noise)                    # I(1)
+        level2 = np.cumsum(level1 - level1.mean())   # I(2), zero-centred drift
+
+        # Scale to plausible CPU range [10, 90]
+        def _scale(x):
+            lo, hi = x.min(), x.max()
+            return 10.0 + 80.0 * (x - lo) / (hi - lo + 1e-9)
+
+        avg = _scale(level2 + rng.normal(0, 0.1, n))
+        mx  = np.clip(avg + np.abs(rng.normal(2, 0.3, n)), 0, 100)
+        mn  = np.clip(avg - np.abs(rng.normal(2, 0.3, n)), 0, 100)
+
+        df_i2 = pd.DataFrame({'timestamp_dt': idx, 'avg_cpu': avg,
+                               'max_cpu': mx, 'min_cpu': mn})
+
+        result = run_var_forecast(df_i2, forecast_steps=8)
+
+        # 1. Differencing order should be 2
+        assert result['diff_order'] == 2, (
+            f"Expected diff_order=2 for I(2) data, got {result['diff_order']}"
+        )
+
+        # 2. All forecasts finite (no NaN/Inf after d=2 re-integration)
+        for col in VAR_COLS:
+            fc = result['forecasts'][col].values
+            assert np.all(np.isfinite(fc)), (
+                f"{col} forecast contains NaN/Inf after d=2 re-integration"
+            )
+
+        # 3. Forecast index strictly after last historical timestamp
+        last_hist_ts = idx[-1]
+        for col in VAR_COLS:
+            assert result['forecasts'][col].index[0] > last_hist_ts, (
+                f"{col} forecast starts before or at last historical timestamp"
+            )
+
+
+# ---------------------------------------------------------------------------
+# _BoxCoxLayer tests
+# ---------------------------------------------------------------------------
+
+class TestBoxCoxLayer:
+
+    @pytest.fixture(scope="class")
+    def cpu_series(self):
+        """Plausible CPU % series with a few near-zero values."""
+        np.random.seed(99)
+        n   = 120
+        idx = pd.date_range("2023-01-01", periods=n, freq="5min")
+        vals = np.clip(30 + 8 * np.sin(2 * np.pi * np.arange(n) / 12)
+                       + np.random.normal(0, 1, n), 0.0, 100.0)
+        # Insert a couple of genuine-zero values
+        vals[[5, 42]] = 0.0
+        return pd.Series(vals, index=idx, name="avg_cpu")
+
+    def test_lambda_is_finite_float(self, cpu_series):
+        """Estimated lambda must be a finite float."""
+        layer = _BoxCoxLayer(cpu_series)
+        assert isinstance(layer.lam, float)
+        assert np.isfinite(layer.lam)
+
+    def test_transform_returns_same_index(self, cpu_series):
+        """transform() output index must match input index."""
+        layer = _BoxCoxLayer(cpu_series)
+        t     = layer.transform(cpu_series)
+        assert t.index.equals(cpu_series.index)
+
+    def test_round_trip_within_tolerance(self, cpu_series):
+        """
+        transform → inverse must recover the original series within ±0.01 %
+        (numerical tolerance of scipy's inv_boxcox).
+        """
+        layer   = _BoxCoxLayer(cpu_series)
+        # Use clipped series as the 'true' input (zeros become floor)
+        clipped = cpu_series.clip(lower=layer.floor)
+        t       = layer.transform(clipped)
+        recovered = layer.inverse(t)
+        np.testing.assert_allclose(
+            recovered.values, clipped.values,
+            rtol=1e-4, atol=0.01,
+            err_msg="Box-Cox round-trip failed: max error exceeds 0.01 %",
+        )
+
+    def test_zero_values_handled(self, cpu_series):
+        """transform() must NOT raise when zeros are present in the input."""
+        layer = _BoxCoxLayer(cpu_series)
+        t = layer.transform(cpu_series)   # should not raise
+        assert np.all(np.isfinite(t.values)), "transform produced non-finite values on zero-containing input"
+
+    def test_inverse_clips_to_cpu_range(self, cpu_series):
+        """inverse() must clip output to [0, 100]."""
+        layer  = _BoxCoxLayer(cpu_series)
+        # Feed extreme transformed values — inverse must not exceed [0, 100]
+        extreme = pd.Series([1e6, -1e6, 0.0], index=[0, 1, 2])
+        result  = layer.inverse(extreme)
+        assert result.min() >= 0.0
+        assert result.max() <= 100.0

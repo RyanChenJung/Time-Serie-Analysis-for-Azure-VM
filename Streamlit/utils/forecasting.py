@@ -48,6 +48,55 @@ class _StdoutCapture:
         sys.stdout = self._orig
 
 
+class _BoxCoxLayer:
+    """
+    Optional Box-Cox variance-stabilisation preprocessing layer.
+
+    Estimates lambda by MLE (``scipy.stats.boxcox``) from the provided series,
+    applies the transform before model fitting, and inverse-transforms
+    forecasts / CI bounds back to the original scale.
+
+    Zero handling
+    -------------
+    Values are clipped to ``floor`` (default 0.01 %) before transforming.
+    This prevents log/power-domain blow-up on zero CPU readings.  The inverse
+    transform clips the result to [0, 100] for valid CPU-percentage range.
+
+    Lambda ≈ 0  → log transform (natural stabilisation for skewed data).
+    Lambda ≈ 1  → near-identity; transform has negligible practical effect.
+    """
+
+    def __init__(self, series: pd.Series, floor: float = 0.01):
+        from scipy.stats import boxcox as _fit_boxcox
+        self.floor = float(floor)
+        s_pos = series.clip(lower=self.floor).dropna().values
+        _, self.lam = _fit_boxcox(s_pos)
+        self.lam = float(self.lam)
+
+    def transform(self, series: pd.Series) -> pd.Series:
+        """Apply Box-Cox; returns a Series with the same index."""
+        s_pos = series.clip(lower=self.floor).values
+        if abs(self.lam) < 1e-8:
+            transformed = np.log(s_pos)
+        else:
+            transformed = (s_pos ** self.lam - 1.0) / self.lam
+        return pd.Series(transformed, index=series.index)
+
+    def inverse(self, series: pd.Series) -> pd.Series:
+        """Inverse Box-Cox; clips result to [0, 100] for CPU %."""
+        from scipy.special import inv_boxcox as _inv
+        vals = _inv(series.values, self.lam)
+        return pd.Series(np.clip(vals, 0.0, 100.0), index=series.index)
+
+    def inverse_ci(
+        self,
+        lower: pd.Series,
+        upper: pd.Series,
+    ) -> "tuple[pd.Series, pd.Series]":
+        """Inverse-transform a CI pair; preserves ordering."""
+        return self.inverse(lower), self.inverse(upper)
+
+
 def _future_index(series: pd.Series, steps: int) -> pd.DatetimeIndex:
     """Build a DatetimeIndex for `steps` future periods after the series end."""
     freq_td = _infer_freq_td(series)
@@ -102,6 +151,7 @@ def run_sarima_forecast(
     seasonal_order: tuple,
     forecast_steps: int,
     exog_df: "pd.DataFrame | None" = None,
+    use_boxcox: bool = False,
 ) -> dict:
     """
     Dual-execution SARIMA / ARIMAX: validation fit (80 / 20) + final fit (100%).
@@ -133,11 +183,18 @@ def run_sarima_forecast(
     series = _validate_series(series)
     model_name = 'ARIMAX' if exog_df is not None else 'SARIMA'
 
+    # ── Optional Box-Cox pre-processing ─────────────────────────────────────
+    _bc_layer: '_BoxCoxLayer | None' = None
+    _series_orig = series.copy()   # original levels — always kept for metric fix-up
+    if use_boxcox:
+        _bc_layer = _BoxCoxLayer(series)
+        series    = _bc_layer.transform(series)
+
     # ── Align exog to series index (handles cases where timestamps differ) ──────
     if exog_df is not None:
-        exog_df = exog_df.reindex(series.index).dropna()
-        # Trim series to the common index after reindex/dropna
-        series = series.loc[exog_df.index]
+        exog_df      = exog_df.reindex(series.index).dropna()
+        series       = series.loc[exog_df.index]
+        _series_orig = _series_orig.loc[exog_df.index]
 
     p, d, q = order
     P, D, Q, s = seasonal_order
@@ -222,14 +279,36 @@ def run_sarima_forecast(
     fc_mean.index = future_idx
     fc_ci.index   = future_idx
 
+    # ── Box-Cox inverse (if enabled) ────────────────────────────────────────
+    boxcox_lambda = None
+    _ci_lo = fc_ci.iloc[:, 0].copy()
+    _ci_hi = fc_ci.iloc[:, 1].copy()
+    if _bc_layer is not None:
+        boxcox_lambda   = _bc_layer.lam
+        fc_mean         = _bc_layer.inverse(fc_mean)
+        _ci_lo, _ci_hi  = _bc_layer.inverse_ci(_ci_lo, _ci_hi)
+        if not val_predictions.empty:
+            val_predictions = _bc_layer.inverse(val_predictions)
+            from sklearn.metrics import mean_squared_error as _mse, mean_absolute_error as _mae
+            _yt  = _series_orig.loc[val_predictions.index].values
+            _yp  = val_predictions.values
+            if np.all(np.isfinite(_yp)):
+                _rm  = float(np.sqrt(_mse(_yt, _yp)))
+                _ma  = float(_mae(_yt, _yp))
+                _mk  = _yt != 0
+                _mp  = (float(np.mean(np.abs((_yt[_mk] - _yp[_mk]) / _yt[_mk]))) * 100) \
+                       if _mk.any() else 0.0
+                val_metrics = {'RMSE': _rm, 'MAE': _ma, 'MAPE': _mp}
+
     return {
         'mean':            fc_mean,
-        'upper':           fc_ci.iloc[:, 1],
-        'lower':           fc_ci.iloc[:, 0],
+        'upper':           _ci_hi,
+        'lower':           _ci_lo,
         'aic':             float(res_final.aic),
         'val_metrics':     val_metrics,
         'val_predictions': val_predictions,
         'model_name':      model_name,
+        'boxcox_lambda':   boxcox_lambda,
     }
 
 
@@ -244,6 +323,7 @@ def run_holt_winters_forecast(
     seasonal_periods: int,
     damped: bool,
     forecast_steps: int,
+    use_boxcox: bool = False,
 ) -> dict:
     """
     Dual-execution Holt-Winters: validation fit (80 / 20) + final fit (100%).
@@ -274,6 +354,13 @@ def run_holt_winters_forecast(
     from sklearn.metrics import mean_squared_error, mean_absolute_error
 
     series = _validate_series(series)
+
+    # ── Optional Box-Cox pre-processing ─────────────────────────────────────
+    _bc_layer_hw: '_BoxCoxLayer | None' = None
+    _series_orig_hw = series.copy()
+    if use_boxcox:
+        _bc_layer_hw = _BoxCoxLayer(series)
+        series       = _bc_layer_hw.transform(series)
 
     # Aperiodic guard: if no seasonal period, disable seasonal component
     if seasonal_periods <= 1:
@@ -354,6 +441,27 @@ def run_holt_winters_forecast(
     d_str = ' (Damped)' if damped_trend else ''
     label = f'HW · T={t_str}{d_str} · S={s_str} · m={seasonal_periods}'
 
+    # ── Box-Cox inverse (if enabled) ────────────────────────────────────────
+    boxcox_lambda_hw = None
+    if _bc_layer_hw is not None:
+        boxcox_lambda_hw = _bc_layer_hw.lam
+        fc_mean          = _bc_layer_hw.inverse(fc_mean)
+        fc_lower, fc_upper = _bc_layer_hw.inverse_ci(fc_lower, fc_upper)
+        if not val_predictions.empty:
+            val_predictions = _bc_layer_hw.inverse(val_predictions)
+            _test_orig = _series_orig_hw.iloc[split:]
+            val_residuals = _test_orig - val_predictions
+            from sklearn.metrics import mean_squared_error as _mse, mean_absolute_error as _mae
+            _yt = _test_orig.values
+            _yp = val_predictions.values[:len(_yt)]
+            if np.all(np.isfinite(_yp)):
+                _rm = float(np.sqrt(_mse(_yt, _yp)))
+                _ma = float(_mae(_yt, _yp))
+                _mk = _yt != 0
+                _mp = (float(np.mean(np.abs((_yt[_mk] - _yp[_mk]) / _yt[_mk]))) * 100) \
+                      if _mk.any() else 0.0
+                val_metrics = {'RMSE': _rm, 'MAE': _ma, 'MAPE': _mp}
+
     return {
         'mean':            fc_mean,
         'upper':           fc_upper,
@@ -363,6 +471,7 @@ def run_holt_winters_forecast(
         'val_predictions': val_predictions,
         'val_residuals':   val_residuals,
         'model_label':     label,
+        'boxcox_lambda':   boxcox_lambda_hw,
     }
 
 
@@ -647,3 +756,416 @@ def stream_auto_arima(
         'order':          (p, d, q),
         'seasonal_order': (P, D, Q, s),
     }
+
+
+# ---------------------------------------------------------------------------
+# Vector Autoregression (VAR) — Multivariate System (Phase 3.3b)
+# ---------------------------------------------------------------------------
+
+def run_var_forecast(
+    vm_df: pd.DataFrame,
+    forecast_steps: int,
+    maxlags: int = 15,
+    alpha: float = 0.05,
+    use_boxcox: bool = False,
+) -> dict:
+    """
+    Multivariate VAR forecast for the system [avg_cpu, max_cpu, min_cpu].
+
+    Auto-Stationarity Pipeline (iterative)
+    ----------------------------------------
+    1. Run ADF on all three series at the current differencing order d.
+    2. If all pass (p < alpha) → fit VAR at this d.
+    3. Otherwise increment d and repeat up to d_max = 2.
+    4. Before each differencing step the "tail seeds" (last d rows of the
+       original and first-differenced series) are stored.  These seeds are
+       used for the nested cumsum re-integration described below.
+
+    Re-integration (inverting d differences)
+    -----------------------------------------
+    The VAR forecasts are produced in the Δ^d domain.  Recovery to levels:
+
+    d = 1:
+        Δ̂y_{T+h} = VAR forecast
+        ŷ_{T+h} = y_T + cumsum(Δ̂y)
+        Seed: y_T  (last row of original levels)
+
+    d = 2:
+        Δ²̂y_{T+h} = VAR forecast
+        Step 1 — recover Δy:
+            Δ̂y_{T+h} = Δy_T + cumsum(Δ²̂y)
+            Seed: Δy_T = y_T − y_{T-1}  (last row of first-diff series)
+        Step 2 — recover y:
+            ŷ_{T+h} = y_T + cumsum(Δ̂y)
+            Seed: y_T  (last row of original levels)
+
+    Both steps are identical in code — they are cumsum() + anchor.
+
+    Validation
+    ----------
+    80 / 20 hold-out.  RMSE / MAE / MAPE always compared against **original
+    level** data, regardless of d, using the same re-integration logic.
+
+    Granger Causality
+    -----------------
+    Run on the stationary (fully-differenced) data for statistical validity.
+
+    NaN / Inf guard
+    ---------------
+    If any forecast value is non-finite after re-integration, each affected
+    column falls back to a simple drift forecast (mean change × h).
+
+    Parameters
+    ----------
+    vm_df          : DataFrame with columns ['timestamp_dt', 'avg_cpu',
+                     'max_cpu', 'min_cpu'].
+    forecast_steps : Number of future steps to produce.
+    maxlags        : Maximum lag order for select_order().
+    alpha          : ADF significance level (default 0.05).
+
+    Returns
+    -------
+    dict with keys:
+        forecasts       – {col: pd.Series (DatetimeIndex)}
+        val_metrics     – {col: {RMSE, MAE, MAPE}}
+        val_predictions – {col: pd.Series (hold-out predictions, level domain)}
+        lag_order       – int
+        diff_order      – int  (0, 1, or 2)
+        adf_pvalues     – {col: float}  (p-values at chosen d)
+        granger         – {"cause→effect": {p_value, significant, max_lag}}
+        var_residuals   – pd.DataFrame (fitted residuals in transformed domain)
+        aic             – float
+
+    Raises
+    ------
+    ValueError   if vm_df has < 30 rows or missing columns.
+    RuntimeError if the final VAR fit fails at every configuration.
+    """
+    from statsmodels.tsa.api import VAR
+    from statsmodels.tsa.stattools import adfuller
+    from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+    # ── 0. Input validation ───────────────────────────────────────────────────
+    required_cols = {'timestamp_dt', 'avg_cpu', 'max_cpu', 'min_cpu'}
+    missing = required_cols - set(vm_df.columns)
+    if missing:
+        raise ValueError(f"vm_df is missing columns: {missing}")
+
+    VAR_COLS = ['avg_cpu', 'max_cpu', 'min_cpu']
+    df_orig  = vm_df.set_index('timestamp_dt')[VAR_COLS].copy().dropna()
+
+    if len(df_orig) < 30:
+        raise ValueError(
+            f"VAR requires at least 30 observations; got {len(df_orig)}."
+        )
+
+    # ── Optional Box-Cox pre-processing (per column, individual lambdas) ─────
+    # df_levels = truly original CPU %, used for metric comparison & drift fallback.
+    # df_orig   = working copy (Box-Cox transformed if use_boxcox, else identical).
+    df_levels = df_orig.copy()   # always original CPU scale
+    var_bc_layers: "dict[str, _BoxCoxLayer]" = {}
+    if use_boxcox:
+        for _col in VAR_COLS:
+            var_bc_layers[_col] = _BoxCoxLayer(df_orig[_col])
+        for _col in VAR_COLS:
+            df_orig[_col] = var_bc_layers[_col].transform(df_orig[_col])
+
+    # ── 1. Iterative ADF loop — find minimum d ∈ {0, 1, 2} ──────────────────
+    # At each iteration we test the *currently transformed* df_work.
+    # We store the tail seeds needed for re-integration before each diff step.
+
+    D_MAX = 2
+    df_work      = df_orig.copy()
+    diff_order   = 0
+    adf_pvalues: dict[str, float] = {}
+
+    # Seeds: seed_level[d_i] = last row of df after applying d_i differences
+    # We need seeds[0] = last of levels, seeds[1] = last of first-diff if d=2.
+    seed_level:  pd.Series | None = None  # y_T          (always needed if d≥1)
+    seed_delta1: pd.Series | None = None  # Δy_T          (needed only if d=2)
+
+    for _d in range(D_MAX + 1):
+        # ADF test on current df_work
+        _pvals: dict[str, float] = {}
+        for col in VAR_COLS:
+            try:
+                _pvals[col] = float(adfuller(df_work[col].dropna().values)[1])
+            except Exception:
+                _pvals[col] = 1.0
+
+        if all(p < alpha for p in _pvals.values()):
+            # All stationary at this d — use it
+            diff_order  = _d
+            adf_pvalues = _pvals
+            break
+
+        if _d < D_MAX:
+            # Store seed for re-integration before differencing
+            if _d == 0:
+                seed_level  = df_work.iloc[-1].copy()   # y_T
+            elif _d == 1:
+                seed_delta1 = df_work.iloc[-1].copy()   # Δy_T  (last of Δy)
+
+            # Difference and advance
+            df_work   = df_work.diff().dropna()
+            diff_order = _d + 1
+        else:
+            # d=2 failed ADF too — still proceed at d=2, record p-values
+            adf_pvalues = _pvals
+
+    # If we differentiated at least once, ensure seeds are set
+    if diff_order >= 1 and seed_level is None:
+        seed_level = df_orig.iloc[-1].copy()
+    if diff_order == 2 and seed_delta1 is None:
+        seed_delta1 = df_orig.diff().dropna().iloc[-1].copy()
+
+    # ── Helper: re-integrate Δ^d forecasts back to levels ────────────────────
+    def _recover_levels(
+        fc_diff_d: pd.DataFrame,
+        d: int,
+    ) -> pd.DataFrame:
+        """
+        Convert a DataFrame of Δ^d forecasts to level forecasts.
+
+        Parameters
+        ----------
+        fc_diff_d : DataFrame in the Δ^d domain (rows = future steps,
+                    columns = VAR_COLS).
+        d         : differencing order actually applied (0, 1, or 2).
+
+        Returns
+        -------
+        DataFrame in the original level domain.
+        """
+        if d == 0:
+            return fc_diff_d.copy()
+
+        recovered = fc_diff_d.copy()
+
+        if d == 1:
+            # ŷ = y_T + cumsum(Δ̂y)
+            for col in VAR_COLS:
+                anchor = float(seed_level[col])  # type: ignore[index]
+                recovered[col] = float(anchor) + fc_diff_d[col].cumsum().values
+
+        elif d == 2:
+            # Step 1: recover Δy from Δ²y  →  Δ̂y = Δy_T + cumsum(Δ²̂y)
+            delta1_fc = fc_diff_d.copy()
+            for col in VAR_COLS:
+                anchor_d1 = float(seed_delta1[col])  # type: ignore[index]
+                delta1_fc[col] = anchor_d1 + fc_diff_d[col].cumsum().values
+
+            # Step 2: recover y from Δy  →  ŷ = y_T + cumsum(Δ̂y)
+            for col in VAR_COLS:
+                anchor_d0 = float(seed_level[col])  # type: ignore[index]
+                recovered[col] = anchor_d0 + delta1_fc[col].cumsum().values
+
+        return recovered
+
+    def _recover_levels_val(
+        fc_diff_d: pd.DataFrame,
+        d: int,
+        val_seed_level: pd.Series,
+        val_seed_delta1: pd.Series | None,
+    ) -> pd.DataFrame:
+        """Same as _recover_levels but uses validation-window seeds."""
+        if d == 0:
+            return fc_diff_d.copy()
+
+        recovered = fc_diff_d.copy()
+
+        if d == 1:
+            for col in VAR_COLS:
+                recovered[col] = (float(val_seed_level[col])
+                                  + fc_diff_d[col].cumsum().values)
+        elif d == 2:
+            delta1_fc = fc_diff_d.copy()
+            for col in VAR_COLS:
+                anchor_d1 = float(val_seed_delta1[col])  # type: ignore[index]
+                delta1_fc[col] = anchor_d1 + fc_diff_d[col].cumsum().values
+            for col in VAR_COLS:
+                anchor_d0 = float(val_seed_level[col])
+                recovered[col] = anchor_d0 + delta1_fc[col].cumsum().values
+
+        return recovered
+
+    # ── 2. Lag-cap helper ────────────────────────────────────────────────────
+    def _safe_lag_order(model: "VAR", n_obs: int, fallback: int = 1) -> int:  # type: ignore[name-defined]
+        _cap = max(1, min(maxlags, n_obs // 4 - 1, 15))
+        try:
+            sel = model.select_order(maxlags=_cap)
+            return max(int(sel.aic), 1)
+        except Exception:
+            return fallback
+
+    # ── 3. 80 / 20 Validation split ──────────────────────────────────────────
+    # Split is applied on df_work (the stationary transformed series).
+    split    = int(len(df_work) * 0.8)
+    train_wk = df_work.iloc[:split]
+    test_wk  = df_work.iloc[split:]
+
+    # Validation-window seeds for re-integration.
+    # "split - 1" in df_work corresponds to a different row in df_orig
+    # depending on d (because diff().dropna() drops the first d rows).
+    # df_orig index offset: df_work.index[split-1] == df_orig.loc[that timestamp]
+    _val_split_ts = df_work.index[split - 1]
+
+    # Note: val_seed_level is in the Box-Cox domain (if use_boxcox=True) because
+    # df_orig was already transformed above.  Re-integration happens in that domain;
+    # the Box-Cox inverse applied later brings predictions back to original scale.
+    val_seed_level:  pd.Series = df_orig.loc[_val_split_ts].copy()
+    val_seed_delta1: pd.Series | None = None
+    if diff_order == 2:
+        # df_orig.diff() at the split boundary
+        _delta1_at_split = df_orig.diff().dropna()
+        val_seed_delta1  = _delta1_at_split.loc[_val_split_ts].copy() \
+            if _val_split_ts in _delta1_at_split.index \
+            else df_orig.diff().dropna().iloc[split - 1].copy()
+
+    val_predictions: dict[str, pd.Series] = {c: pd.Series(dtype=float) for c in VAR_COLS}
+    val_metrics: dict[str, dict]          = {
+        c: {'RMSE': np.nan, 'MAE': np.nan, 'MAPE': np.nan} for c in VAR_COLS
+    }
+    val_lag_order = 1
+
+    if len(test_wk) > 0 and len(train_wk) >= 10:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            try:
+                mod_val       = VAR(train_wk)
+                val_lag_order = _safe_lag_order(mod_val, len(train_wk), 1)
+                res_val       = mod_val.fit(maxlags=val_lag_order, ic=None, verbose=False)
+
+                fc_val_raw = res_val.forecast(
+                    train_wk.values[-val_lag_order:], steps=len(test_wk)
+                )
+                fc_val_df = pd.DataFrame(fc_val_raw, columns=VAR_COLS, index=test_wk.index)
+
+                # Re-integrate to levels (in Box-Cox domain if use_boxcox)
+                fc_val_lvl = _recover_levels_val(
+                    fc_val_df, diff_order, val_seed_level, val_seed_delta1
+                )
+
+                # Inverse Box-Cox → original CPU scale
+                if use_boxcox:
+                    for _c in VAR_COLS:
+                        fc_val_lvl[_c] = var_bc_layers[_c].inverse(fc_val_lvl[_c])
+
+                # Always compare against truly original levels (no Box-Cox)
+                test_lvl = df_levels.loc[test_wk.index]
+
+                for col in VAR_COLS:
+                    y_true = test_lvl[col].values
+                    y_pred = fc_val_lvl[col].values[:len(y_true)]
+
+                    # NaN guard
+                    if not np.all(np.isfinite(y_pred)):
+                        continue
+
+                    val_predictions[col] = pd.Series(
+                        y_pred, index=test_lvl.index[:len(y_pred)]
+                    )
+                    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+                    mae  = float(mean_absolute_error(y_true, y_pred))
+                    mask = y_true != 0
+                    mape = (float(np.mean(
+                        np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])
+                    )) * 100) if mask.any() else 0.0
+                    val_metrics[col] = {'RMSE': rmse, 'MAE': mae, 'MAPE': mape}
+
+            except Exception:
+                pass   # val_metrics stays as NaN dict — non-fatal
+
+    # ── 4. Final fit on 100 % of df_work ─────────────────────────────────────
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        try:
+            mod_final = VAR(df_work)
+            lag_order = _safe_lag_order(mod_final, len(df_work), val_lag_order)
+            res_final = mod_final.fit(maxlags=lag_order, ic=None, verbose=False)
+        except Exception as exc:
+            raise RuntimeError(f"VAR final fit failed: {exc}") from exc
+
+    aic_val = float(res_final.aic)
+
+    # ── 5. Multi-step forecast ────────────────────────────────────────────────
+    freq_td = _infer_freq_td(df_orig['avg_cpu'])
+    last_ts = df_orig.index[-1]
+    fut_idx = pd.date_range(start=last_ts + freq_td, periods=forecast_steps, freq=freq_td)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        fc_raw = res_final.forecast(df_work.values[-lag_order:], steps=forecast_steps)
+
+    fc_df_raw = pd.DataFrame(fc_raw, columns=VAR_COLS, index=fut_idx)
+
+    # Re-integrate to levels (in Box-Cox domain if use_boxcox)
+    fc_df = _recover_levels(fc_df_raw, diff_order)
+
+    # Inverse Box-Cox → original CPU scale
+    if use_boxcox:
+        for col in VAR_COLS:
+            fc_df[col] = var_bc_layers[col].inverse(fc_df[col])
+
+    # ── NaN / Inf fallback: drift from original CPU levels ───────────────────
+    for col in VAR_COLS:
+        if not np.all(np.isfinite(fc_df[col].values)):
+            # Drift = mean of last 10 first-differences of ORIGINAL levels
+            _delta   = df_levels[col].diff().dropna().iloc[-10:].mean()
+            _last_v  = float(df_levels[col].iloc[-1])
+            _drift_fc = pd.Series(
+                [_last_v + _delta * h for h in range(1, forecast_steps + 1)],
+                index=fut_idx,
+            )
+            fc_df[col] = _drift_fc
+
+    forecasts = {col: fc_df[col] for col in VAR_COLS}
+
+    # ── 6. Residuals (in transformed/stationary domain) ───────────────────────
+    resid_df = pd.DataFrame(
+        res_final.resid,
+        columns=VAR_COLS,
+        index=df_work.index[lag_order:],
+    )
+
+    # ── 7. Granger causality (on stationary data for validity) ───────────────
+    granger: dict[str, dict] = {}
+    for cause in VAR_COLS:
+        for effect in VAR_COLS:
+            if cause == effect:
+                continue
+            key = f"{cause}→{effect}"
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    gc_res = res_final.test_causality(
+                        caused=effect, causing=cause, kind='f', signif=alpha,
+                    )
+                    gc_p = float(gc_res.pvalue)
+                    granger[key] = {
+                        'p_value':    gc_p,
+                        'significant': gc_p < alpha,
+                        'max_lag':     lag_order,
+                    }
+            except Exception:
+                granger[key] = {
+                    'p_value':    np.nan,
+                    'significant': False,
+                    'max_lag':     lag_order,
+                }
+
+    return {
+        'forecasts':        forecasts,
+        'val_metrics':      val_metrics,
+        'val_predictions':  val_predictions,
+        'lag_order':        int(lag_order),
+        'diff_order':       int(diff_order),
+        'adf_pvalues':      adf_pvalues,
+        'granger':          granger,
+        'var_residuals':    resid_df,
+        'aic':              aic_val,
+        'boxcox_lambdas':   {c: var_bc_layers[c].lam for c in VAR_COLS}
+                            if use_boxcox else None,
+    }
+
+
