@@ -1,2 +1,33 @@
 Data/vmtable.csv.gz
 .ipynb_checkpoints
+
+# --- Python Related ---
+__pycache__/
+*.py[cod]
+*.class
+.ipynb_checkpoints/
+
+# --- env ---
+venv/
+.env
+.venv
+env/
+bin/
+lib/
+include/
+
+# --- Streamlit Cache ---
+cache/*.pkl
+
+# --- System ---
+.DS_Store
+Thumbs.db
+
+# --- Streamlit ---
+.streamlit/config.toml
+
+# Ryan's Data Shield
+Data/
+Streamlit/cache/
+*.pkl
+.DS_Store
